@@ -1,4 +1,3 @@
-
 import { Boom } from '@hapi/boom'
 import NodeCache from 'node-cache'
 import { proto } from '../../WAProto'
@@ -382,7 +381,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							}
 						})
 
-						await assertSessions(senderKeyJids, false)
+						console.log('\n\n\nsenderKeyJids', senderKeyJids)
+						const senderKeysChunks: string[][] = []
+						for(let i = 0; i < senderKeyJids.length; i += 255) {
+							senderKeysChunks.push(senderKeyJids.slice(i, i + 255))
+						}
+
+						console.log('\n\n\nsenderKeysChunks', senderKeysChunks)
+						await Promise.all(senderKeysChunks.map(chunk => assertSessions(chunk, false)))
 
 						const result = await createParticipantNodes(senderKeyJids, encSenderKeyMsg)
 						shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || result.shouldIncludeDeviceIdentity
@@ -445,14 +451,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || s1 || s2
 				}
 
-				if(participants.length) {
-					binaryNodeContent.push({
-						tag: 'participants',
-						attrs: { },
-						content: participants
-					})
-				}
-
 				const stanza: BinaryNode = {
 					tag: 'message',
 					attrs: {
@@ -462,10 +460,28 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					},
 					content: binaryNodeContent
 				}
+				if(shouldIncludeDeviceIdentity) {
+					(stanza.content as BinaryNode[]).push({
+						tag: 'device-identity',
+						attrs: {},
+						content: proto.ADVSignedDeviceIdentity.encode(authState.creds.account).finish()
+					})
+
+					logger.debug({ jid }, 'adding device identity')
+				}
+
 				// if the participant to send to is explicitly specified (generally retry recp)
 				// ensure the message is only sent to that person
 				// if a retry receipt is sent to everyone -- it'll fail decryption for everyone else who received the msg
 				if(participant) {
+					if(participants.length) {
+						binaryNodeContent.push({
+							tag: 'participants',
+							attrs: {},
+							content: participants
+						})
+					}
+
 					if(isJidGroup(destinationJid)) {
 						stanza.attrs.to = destinationJid
 						stanza.attrs.participant = participant
@@ -475,23 +491,34 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					} else {
 						stanza.attrs.to = participant
 					}
+
+					logger.debug({ msgId }, `sending message to ${participants.length} devices`)
+
+					await sendNode(stanza)
 				} else {
 					stanza.attrs.to = destinationJid
+
+					if(participants.length) {
+						const participantsChunk: BinaryNode[][] = []
+						for(let i = 0; i < participants.length; i += 255) {
+							participantsChunk.push(participants.slice(i, i + 255))
+						}
+
+						await Promise.all(participantsChunk.map(chunk => {
+							const chunkStanza = Object.assign({}, stanza);
+							(chunkStanza.content as BinaryNode[]).push({
+								tag: 'participants',
+								attrs: {},
+								content: chunk
+							})
+							logger.debug({ msgId }, `sending message to ${chunk.length} devices`)
+							return sendNode(chunkStanza)
+						}))
+					} else {
+						logger.debug({ msgId }, `sending message to ${participants.length} devices`)
+						await sendNode(stanza)
+					}
 				}
-
-				if(shouldIncludeDeviceIdentity) {
-					(stanza.content as BinaryNode[]).push({
-						tag: 'device-identity',
-						attrs: { },
-						content: proto.ADVSignedDeviceIdentity.encode(authState.creds.account).finish()
-					})
-
-					logger.debug({ jid }, 'adding device identity')
-				}
-
-				logger.debug({ msgId }, `sending message to ${participants.length} devices`)
-
-				await sendNode(stanza)
 			}
 		)
 
